@@ -1,0 +1,432 @@
+#!/bin/bash
+
+# ===============================
+#   Interactive Banking System
+#   (Redesigned TUI + Features)
+# ===============================
+# Author: Anis & GPT-5 Thinking
+# Notes:
+#   - Persistent storage in CSV files
+#   - Styled terminal UI (boxes/tables)
+#   - Account Activities submenu
+#   - Daily ATM limit + 3 wrong PIN -> LOCKED
+#   - Statement view protected by password
+#   - Run: chmod +x updatebipc.sh
+#   - Run: ./updatebipc.sh
+
+# ---------- Config ----------
+ACCOUNTS_FILE="accounts.db"   # CSV: acc,name,pin,balance,status,last_withdraw_date,daily_withdraw,wrong_attempts
+LOG_FILE="transactions.log"
+DAILY_LIMIT=20000
+STATEMENT_PASS="320101"
+
+# ---------- Colors ----------
+NC='\033[0m'
+FG_WHITE='\033[1;37m'
+FG_GRAY='\033[0;37m'
+FG_RED='\033[0;31m'
+FG_GREEN='\033[0;32m'
+FG_YELLOW='\033[0;33m'
+FG_BLUE='\033[0;34m'
+FG_CYAN='\033[0;36m'
+
+# ---------- Init ----------
+init_files() {
+  [[ -f "$ACCOUNTS_FILE" ]] || touch "$ACCOUNTS_FILE"
+  [[ -f "$LOG_FILE" ]] || touch "$LOG_FILE"
+}
+
+# ---------- UI Helpers ----------
+line() { printf "${FG_GRAY}%s${NC}\n" "$(printf '─%.0s' $(seq 1 60))"; }
+header() {
+  clear
+  line
+  printf "${FG_WHITE}%*s${NC}\n" $(((${#1}+60)/2)) "$1"
+  line
+}
+box_msg() { # type icon message
+  local type="$1"; local icon="$2"; shift 2
+  local msg="$*"
+  case "$type" in
+    info)    col="$FG_CYAN" ;;
+    ok)      col="$FG_GREEN";;
+    warn)    col="$FG_YELLOW";;
+    err)     col="$FG_RED"   ;;
+    *)       col="$FG_WHITE";;
+  esac
+  printf "${col}%s ${FG_WHITE}%s${NC}\n" "$icon" "$msg"
+}
+press_enter() { printf "${FG_GRAY}Press Enter to continue...${NC}"; read -r; }
+
+# Table helpers
+print_table_header() { # col1 col2 col3
+  printf "${FG_GRAY}%-15s %-22s %-12s${NC}\n" "$1" "$2" "$3"
+  printf "${FG_GRAY}%s${NC}\n" "$(printf '—%.0s' $(seq 1 60))"
+}
+print_table_row() { # col1 col2 col3
+  printf "%-15s %-22s %-12s\n" "$1" "$2" "$3"
+}
+
+# ---------- Logging ----------
+log_tx() { echo "$(date '+%Y-%m-%d %H:%M:%S') | $1" >> "$LOG_FILE"; }
+
+# ---------- CSV Helpers ----------
+# Fields: 1:acc 2:name 3:pin 4:balance 5:status 6:last_date 7:daily_withdraw 8:wrong_attempts
+row_get() { # acc -> echo full row OR empty
+  awk -F, -v A="$1" '$1==A{print;exit}' "$ACCOUNTS_FILE"
+}
+get_field() { # acc idx
+  awk -F, -v A="$1" -v I="$2" '$1==A{print $I;exit}' "$ACCOUNTS_FILE"
+}
+set_row() { # fullrow -> replace by acc match
+  local acc="$(echo "$1" | cut -d, -f1)"; local tmp=$(mktemp)
+  awk -F, -v A="$acc" -v R="$1" 'BEGIN{OFS=","} $1==A{$0=R}1' "$ACCOUNTS_FILE" > "$tmp" && mv "$tmp" "$ACCOUNTS_FILE"
+}
+update_field() { # acc idx newValue
+  local acc="$1" idx="$2" val="$3" tmp=$(mktemp)
+  awk -F, -v A="$acc" -v I="$2" -v V="$3" 'BEGIN{OFS=","} $1==A{$I=V}1' "$ACCOUNTS_FILE" > "$tmp" && mv "$tmp" "$ACCOUNTS_FILE"
+}
+append_row() { echo "$1" >> "$ACCOUNTS_FILE"; }
+delete_row() { # acc
+  local tmp=$(mktemp); awk -F, -v A="$1" '$1!=A' "$ACCOUNTS_FILE" > "$tmp" && mv "$tmp" "$ACCOUNTS_FILE"
+}
+
+# ---------- Features ----------
+
+add_money() {
+  header "Add Money to Account"
+  read -rp "Enter Account Number: " acc
+  read -rp "Amount (৳): " amt
+  [[ "$amt" =~ ^[0-9]+$ ]] || { box_msg err "✗" "Amount must be numeric."; press_enter; return; }
+  
+  local row; row=$(row_get "$acc")
+  [[ -z "$row" ]] && { box_msg err "✗" "Account not found."; press_enter; return; }
+  
+  local bal stat
+  bal=$(echo "$row" | cut -d, -f4)
+  stat=$(echo "$row" | cut -d, -f5)
+  
+  [[ "$stat" != "ACTIVE" ]] && { box_msg err "✗" "Account is $stat. Cannot add money."; press_enter; return; }
+  
+  local new_bal=$((bal+amt))
+  update_field "$acc" 4 "$new_bal"
+  log_tx "DEPOSIT | ACC:$acc AMT:$amt NEW_BAL:$new_bal"
+  box_msg ok "✓" "Successfully added ৳$amt to account $acc."
+  box_msg info "ℹ" "New Balance: ৳$new_bal"
+  press_enter
+}
+
+account_activities() {
+  while true; do
+    header "Account Activities"
+    echo -e "${FG_WHITE}1.${NC} Active Show"
+    echo -e "${FG_WHITE}2.${NC} Block/Locked Show"
+    echo -e "${FG_WHITE}3.${NC} Block Account"
+    echo -e "${FG_WHITE}4.${NC} Unblock/Unlock Account"
+    echo -e "${FG_WHITE}5.${NC} Delete Account"
+    echo -e "${FG_WHITE}6.${NC} Back to Main Menu"
+    line
+    read -rp "Choose (1-6): " choice
+    case "$choice" in
+      1)
+        header "Active Accounts List"
+        print_table_header "Account No" "Name" "Status"
+        awk -F, '$5=="ACTIVE"{printf "%-15s %-22s %-12s\n", $1,$2,$5}' "$ACCOUNTS_FILE" | sed 's/^/ /'
+        line; press_enter
+        ;;
+      2)
+        header "Blocked/Locked Accounts"
+        print_table_header "Account No" "Name" "Status"
+        awk -F, '$5!="ACTIVE"{printf "%-15s %-22s %-12s\n", $1,$2,$5}' "$ACCOUNTS_FILE" | sed 's/^/ /'
+        line; press_enter
+        ;;
+      3)
+        header "Block Account"
+        read -rp "Enter Account to BLOCK: " acc
+        local row; row=$(row_get "$acc")
+        [[ -z "$row" ]] && { box_msg err "✗" "Account not found."; press_enter; continue; }
+        local status; status=$(echo "$row" | cut -d, -f5)
+        [[ "$status" == "BLOCKED" ]] && { box_msg warn "!" "Already BLOCKED."; press_enter; continue; }
+        update_field "$acc" 5 "BLOCKED"
+        log_tx "ACCOUNT_BLOCKED | ACC:$acc"
+        box_msg ok "✓" "Account $acc is now BLOCKED."
+        press_enter
+        ;;
+      4)
+        header "Unblock/Unlock Account"
+        read -rp "Enter Account to UNLOCK: " acc
+        local row; row=$(row_get "$acc")
+        [[ -z "$row" ]] && { box_msg err "✗" "Account not found."; press_enter; continue; }
+        local status; status=$(echo "$row" | cut -d, -f5)
+        [[ "$status" == "ACTIVE" ]] && { box_msg warn "!" "Account is already ACTIVE."; press_enter; continue; }
+        update_field "$acc" 5 "ACTIVE"
+        update_field "$acc" 8 "0"
+        log_tx "ACCOUNT_UNLOCKED | ACC:$acc"
+        box_msg ok "✓" "Account $acc is now ACTIVE."
+        press_enter
+        ;;
+      5)
+        header "Delete Account"
+        read -rp "Enter Account to DELETE: " acc
+        local row; row=$(row_get "$acc")
+        [[ -z "$row" ]] && { box_msg err "✗" "Account not found."; press_enter; continue; }
+        read -rp "Type DELETE to confirm: " conf
+        [[ "$conf" == "DELETE" ]] || { box_msg warn "!" "Deletion cancelled."; press_enter; continue; }
+        delete_row "$acc"
+        log_tx "ACCOUNT_DELETED | ACC:$acc"
+        box_msg ok "✓" "Account $acc deleted."
+        press_enter
+        ;;
+      6) return ;;
+      *) box_msg err "✗" "Invalid choice."; press_enter ;;
+    esac
+  done
+}
+
+transfer_money() {
+  header "Transfer Money"
+  read -rp "From Account: " from
+  read -rsp "PIN (From): " pin; echo -e
+  read -rp "To Account: " to
+  read -rp "Amount (৳): " amt
+  [[ "$amt" =~ ^[0-9]+$ ]] || { box_msg err "✗" "Amount must be numeric."; press_enter; return; }
+
+  local frow trow
+  frow=$(row_get "$from"); trow=$(row_get "$to")
+  [[ -z "$frow" || -z "$trow" ]] && { box_msg err "✗" "Invalid account(s)."; press_enter; return; }
+
+  local fpin fbal fstat tbal tstat
+  fpin=$(echo "$frow" | cut -d, -f3)
+  fbal=$(echo "$frow" | cut -d, -f4)
+  fstat=$(echo "$frow" | cut -d, -f5)
+  tbal=$(echo "$trow" | cut -d, -f4)
+  tstat=$(echo "$trow" | cut -d, -f5)
+
+  [[ "$fstat" != "ACTIVE" ]] && { box_msg err "✗" "From account is $fstat."; press_enter; return; }
+  [[ "$tstat" != "ACTIVE" ]] && { box_msg err "✗" "To account is $tstat."; press_enter; return; }
+  [[ "$pin" != "$fpin" ]] && { box_msg err "✗" "Incorrect PIN."; press_enter; return; }
+  (( fbal < amt )) && { box_msg err "✗" "Insufficient balance."; press_enter; return; }
+
+  local newf=$((fbal-amt)) newt=$((tbal+amt))
+  update_field "$from" 4 "$newf"
+  update_field "$to"   4 "$newt"
+  log_tx "TRANSFER | FROM:$from TO:$to AMT:$amt"
+  
+  # IMPROVED: Formatted output for better readability
+  header "Transaction Complete"
+  printf "${FG_GREEN}✓ Transfer Successful${NC}\n"
+  printf "    ${FG_WHITE}%-20s: ${NC}%s\n" "From Account" "$from"
+  printf "    ${FG_WHITE}%-20s: ${NC}%s\n" "To Account" "$to"
+  printf "    ${FG_WHITE}%-20s: ${NC}৳%s\n" "Amount Transferred" "$amt"
+  printf "\n"
+  printf "    ${FG_CYAN}%-20s: ${NC}৳%s\n" "New Balance ($from)" "$newf"
+  printf "    ${FG_CYAN}%-20s: ${NC}৳%s\n" "New Balance ($to)" "$newt"
+  
+  press_enter
+}
+
+withdraw_money() {
+  header "ATM Withdrawal"
+  read -rp "Account: " acc
+  read -rsp "PIN: " pin; echo -e
+  read -rp "Amount (৳): " amt
+  [[ "$amt" =~ ^[0-9]+$ ]] || { box_msg err "✗" "Amount must be numeric."; press_enter; return; }
+
+  local row; row=$(row_get "$acc")
+  [[ -z "$row" ]] && { box_msg err "✗" "Account not found."; press_enter; return; }
+  local apin bal stat last dwd wrong today
+  apin=$(echo "$row" | cut -d, -f3)
+  bal=$(echo "$row" | cut -d, -f4)
+  stat=$(echo "$row" | cut -d, -f5)
+  last=$(echo "$row" | cut -d, -f6)
+  dwd=$(echo   "$row" | cut -d, -f7)
+  wrong=$(echo "$row" | cut -d, -f8)
+  today=$(date +%Y-%m-%d)
+
+  [[ "$stat" != "ACTIVE" ]] && { box_msg err "✗" "Account is $stat."; press_enter; return; }
+
+  if [[ "$pin" != "$apin" ]]; then
+    wrong=$((wrong+1))
+    update_field "$acc" 8 "$wrong"
+    if (( wrong >= 3 )); then
+      update_field "$acc" 5 "LOCKED"
+      log_tx "ACCOUNT_LOCKED | ACC:$acc"
+      box_msg err "✗" "Wrong PIN (3x). Account LOCKED!"
+    else
+      box_msg err "✗" "Incorrect PIN. Attempts: $wrong/3"
+    fi
+    press_enter; return
+  fi
+
+  update_field "$acc" 8 0
+
+  if [[ "$last" != "$today" ]]; then dwd=0; fi
+  local new_dwd=$((dwd+amt))
+  (( new_dwd > DAILY_LIMIT )) && { box_msg err "✗" "Daily limit exceeded (৳$DAILY_LIMIT)."; press_enter; return; }
+  (( bal < amt )) && { box_msg err "✗" "Insufficient balance."; press_enter; return; }
+
+  local new_bal=$((bal-amt))
+  update_field "$acc" 4 "$new_bal"
+  update_field "$acc" 6 "$today"
+  update_field "$acc" 7 "$new_dwd"
+  log_tx "WITHDRAW | ACC:$acc AMT:$amt NEW_BAL:$new_bal"
+  
+  # IMPROVED: Formatted output for better readability
+  header "Withdrawal Complete"
+  printf "${FG_GREEN}✓ Dispensed ৳%s${NC}\n" "$amt"
+  printf "    ${FG_WHITE}%-20s: ${NC}%s\n" "Account" "$acc"
+  printf "    ${FG_CYAN}%-20s: ${NC}৳%s\n" "New Balance" "$new_bal"
+  printf "    ${FG_CYAN}%-20s: ${NC}৳%s / ৳%s\n" "Daily Withdrawal" "$new_dwd" "$DAILY_LIMIT"
+
+  press_enter
+}
+
+create_account() {
+  header "Create New Account"
+  read -rp "Enter Account Number (4 digits): " acc
+  [[ "$acc" =~ ^[0-9]{4}$ ]] || { box_msg err "✗" "Invalid account number."; press_enter; return; }
+  [[ -n "$(row_get "$acc")" ]] && { box_msg err "✗" "Account already exists."; press_enter; return; }
+  read -rp "Account Holder Name: " name
+  read -rsp "Set 4-digit PIN: " pin; echo -e
+  [[ "$pin" =~ ^[0-9]{4}$ ]] || { box_msg err "✗" "PIN must be 4 digits."; press_enter; return; }
+  read -rp "Initial Deposit (৳): " bal
+  [[ "$bal" =~ ^[0-9]+$ ]] || { box_msg err "✗" "Amount must be numeric."; press_enter; return; }
+  append_row "$acc,$name,$pin,$bal,ACTIVE,0,0,0"
+  log_tx "ACCOUNT_CREATED | ACC:$acc | NAME:$name | BAL:$bal"
+  box_msg ok "✓" "Account $acc created for $name. Balance ৳$bal"
+  press_enter
+}
+
+change_pin() {
+  header "Change PIN"
+  read -rp "Account: " acc
+  read -rsp "Current PIN: " op; echo -e
+  read -rsp "New PIN (4 digits): " np; echo -e
+  [[ "$np" =~ ^[0-9]{4}$ ]] || { box_msg err "✗" "PIN must be 4 digits."; press_enter; return; }
+  local row; row=$(row_get "$acc")
+  [[ -z "$row" ]] && { box_msg err "✗" "Account not found."; press_enter; return; }
+  local apin; apin=$(echo "$row" | cut -d, -f3)
+  [[ "$op" != "$apin" ]] && { box_msg err "✗" "Incorrect current PIN."; press_enter; return; }
+  update_field "$acc" 3 "$np"
+  log_tx "PIN_CHANGED | ACC:$acc"
+  box_msg ok "✓" "PIN updated successfully."
+  press_enter
+}
+
+check_balance() {
+  header "Balance Inquiry"
+  read -rp "Account: " acc
+  read -rsp "PIN: " pin; echo -e
+  local row; row=$(row_get "$acc")
+  [[ -z "$row" ]] && { box_msg err "✗" "Account not found."; press_enter; return; }
+  local apin bal stat
+  apin=$(echo "$row" | cut -d, -f3)
+  bal=$(echo "$row" | cut -d, -f4)
+  stat=$(echo "$row" | cut -d, -f5)
+  [[ "$pin" != "$apin" ]] && { box_msg err "✗" "Incorrect PIN."; press_enter; return; }
+  [[ "$stat" != "ACTIVE" ]] && { box_msg warn "!" "Account is $stat."; }
+  
+  # IMPROVED: Formatted output for better readability
+  header "Balance Details"
+  printf "    ${FG_WHITE}%-20s: ${NC}%s\n" "Account Number" "$acc"
+  printf "    ${FG_WHITE}%-20s: ${NC}%s\n" "Account Holder" "$(echo "$row" | cut -d, -f2)"
+  printf "    ${FG_WHITE}%-20s: ${NC}৳%s\n" "Current Balance" "$bal"
+  
+  log_tx "BAL_INQUIRY | ACC:$acc BAL:$bal"
+  press_enter
+}
+
+p2p_menu() {
+  while true; do
+    header "P2P Transactions"
+    echo -e "${FG_WHITE}1.${NC} Transfer Money"
+    echo -e "${FG_WHITE}2.${NC} Withdraw Money (ATM)"
+    echo -e "${FG_WHITE}3.${NC} Back to Main Menu"
+    line
+    read -rp "Choose (1-3): " p2p_opt
+    case "$p2p_opt" in
+      1) transfer_money ;;
+      2) withdraw_money ;;
+      3) return ;;
+      *) box_msg err "✗" "Invalid option."; press_enter ;;
+    esac
+  done
+}
+
+statement_history() {
+  header "Statement & History (Protected)"
+  read -rsp "Enter Statement Password: " p; echo -e
+  [[ "$p" != "$STATEMENT_PASS" ]] && { box_msg err "✗" "Access Denied."; press_enter; return; }
+
+  while true; do
+    header "Choose Statement Type"
+    echo -e "${FG_WHITE}1.${NC} Person Statement"
+    echo -e "${FG_WHITE}2.${NC} Full History"
+    echo -e "${FG_WHITE}3.${NC} Back"
+    line
+    read -rp "Choose (1-3): " stmt_opt
+    case "$stmt_opt" in
+      1)
+        read -rp "Enter Account Number: " acc
+        local row; row=$(row_get "$acc")
+        [[ -z "$row" ]] && { box_msg err "✗" "Account not found."; press_enter; continue; }
+        line
+        printf "${FG_WHITE}%-25s | %-15s | %s${NC}\n" "Date & Time" "Type" "Details"
+        line
+        if [[ -s "$LOG_FILE" ]]; then
+          grep "ACC:$acc" "$LOG_FILE" | awk '{print $1" "$2" | "$3" | "$4" "$5" "$6" "$7" "$8}' | nl -ba -w2 -s'. '
+        else
+          box_msg warn "!" "No transactions yet for this account."
+        fi
+        line
+        press_enter
+        ;;
+      2)
+        line
+        printf "${FG_WHITE}%-25s | %s${NC}\n" "Date & Time" "Event"
+        line
+        if [[ -s "$LOG_FILE" ]]; then
+          nl -ba -w2 -s'. ' "$LOG_FILE"
+        else
+          box_msg warn "!" "No transactions yet."
+        fi
+        line
+        press_enter
+        ;;
+      3) return ;;
+      *) box_msg err "✗" "Invalid option."; press_enter ;;
+    esac
+  done
+}
+
+# ---------- Main Menu ----------
+main_menu() {
+  while true; do
+    header "Interactive Banking System"
+    echo -e "${FG_WHITE}1.${NC} Create Account"
+    echo -e "${FG_WHITE}2.${NC} Add Money"
+    echo -e "${FG_WHITE}3.${NC} Account Activities"
+    echo -e "${FG_WHITE}4.${NC} P2P (Peer-to-Peer)"
+    echo -e "${FG_WHITE}5.${NC} Change PIN"
+    echo -e "${FG_WHITE}6.${NC} Check Balance"
+    echo -e "${FG_WHITE}7.${NC} Statement & History"
+    echo -e "${FG_WHITE}8.${NC} Exit"
+    line
+    read -rp "Choose (1-8): " opt
+    case "$opt" in
+      1) create_account ;;
+      2) add_money ;;
+      3) account_activities ;;
+      4) p2p_menu ;;
+      5) change_pin ;;
+      6) check_balance ;;
+      7) statement_history ;;
+      8) header "Goodbye"; exit 0 ;;
+      *) box_msg err "✗" "Invalid option."; press_enter ;;
+    esac
+  done
+}
+
+# ---------- Boot ----------
+init_files
+main_menu
